@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# claude-local: Claude Code を、ローカルの MLX モデル(Heretic 9B)をバックエンドにして起動する。
+#   claude-local            バックエンドを(未起動なら)起動して claude を開く。引数はそのまま claude へ
+#   claude-local status     バックエンドの状態表示
+#   claude-local stop       バックエンド(mlx_lm.server + プロキシ)を停止
+#   claude-local logs       ログを tail
+# バックエンドは claude 終了後も常駐する(次回の起動が即時)。止めるときは `claude-local stop`。
+set -euo pipefail
+
+SRC="${BASH_SOURCE[0]}"
+while [[ -L "$SRC" ]]; do  # シンボリックリンクを辿って実体の場所を求める
+  LINK="$(readlink "$SRC")"
+  [[ "$LINK" == /* ]] && SRC="$LINK" || SRC="$(dirname "$SRC")/$LINK"
+done
+DIR="$(cd "$(dirname "$SRC")" && pwd)"
+MODEL_DIR="${MODEL_DIR:-$DIR/models/heretic-9b-mlx-4bit}"
+MLX_PORT="${MLX_PORT:-8080}"
+PROXY_PORT="${PROXY_PORT:-8082}"
+STATE="$DIR/.state"; mkdir -p "$STATE"
+PY="${PYTHON:-$DIR/.venv/bin/python}"
+
+alive() { [[ -f "$1" ]] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+stop_all() {
+  for n in proxy mlx; do
+    if alive "$STATE/$n.pid"; then kill "$(cat "$STATE/$n.pid")" 2>/dev/null || true; fi
+    rm -f "$STATE/$n.pid"
+  done
+  echo "stopped"
+}
+
+case "${1:-}" in
+  stop) stop_all; exit 0 ;;
+  logs) exec tail -f "$STATE/mlx.log" "$STATE/proxy.log" ;;
+  status)
+    alive "$STATE/mlx.pid" && echo "mlx_lm.server: running (:$MLX_PORT)" || echo "mlx_lm.server: stopped"
+    alive "$STATE/proxy.pid" && echo "proxy: running (:$PROXY_PORT)" || echo "proxy: stopped"
+    exit 0 ;;
+esac
+
+[[ -f "$MODEL_DIR/config.json" ]] || { echo "モデルが見つかりません: $MODEL_DIR" >&2; exit 1; }
+
+if ! alive "$STATE/mlx.pid"; then
+  echo "▶ mlx_lm.server を起動中 (初回はモデル読み込みに数十秒)..."
+  nohup "$PY" -m mlx_lm server --model "$MODEL_DIR" --host 127.0.0.1 --port "$MLX_PORT" \
+    --temp 0.6 --top-p 0.95 --max-tokens 8192 --prompt-cache-size 4 \
+    >"$STATE/mlx.log" 2>&1 &
+  echo $! >"$STATE/mlx.pid"
+fi
+
+if ! alive "$STATE/proxy.pid"; then
+  BACKEND_URL="http://127.0.0.1:$MLX_PORT" BACKEND_MODEL="$MODEL_DIR" PROXY_PORT="$PROXY_PORT" \
+    nohup "$PY" "$DIR/anthropic_proxy.py" >"$STATE/proxy.log" 2>&1 &
+  echo $! >"$STATE/proxy.pid"
+fi
+
+# 準備完了待ち (最大5分)
+for i in $(seq 1 300); do
+  curl -sf "http://127.0.0.1:$MLX_PORT/v1/models" >/dev/null 2>&1 && curl -sf "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 && break
+  alive "$STATE/mlx.pid" || { echo "mlx_lm.server が落ちました。ログ: $STATE/mlx.log" >&2; tail -20 "$STATE/mlx.log" >&2; exit 1; }
+  sleep 1
+done
+
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
+export ANTHROPIC_AUTH_TOKEN="local"
+unset ANTHROPIC_API_KEY
+export ANTHROPIC_MODEL="heretic-9b-local"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
+export ANTHROPIC_SMALL_FAST_MODEL="$ANTHROPIC_MODEL"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export DISABLE_TELEMETRY=1
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+
+exec claude "$@"
