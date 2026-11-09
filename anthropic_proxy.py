@@ -3,6 +3,7 @@
 
 Claude Code  --/v1/messages-->  this proxy  --/v1/chat/completions-->  mlx_lm.server
 """
+import asyncio
 import json
 import os
 import re
@@ -77,6 +78,12 @@ COMPACT_PROMPT = (
     "Be concise but keep every exact path, identifier and number needed to continue."
 )
 _compactions = {}  # first-user-text -> {"n": messages covered, "recap": str}
+
+# Max simultaneous generations sent to the backend (parallel subagents queue here instead of all
+# crawling at once and hitting Claude Code's request timeout). PING_SECS keeps the SSE stream alive.
+PROXY_CONCURRENCY = int(os.environ.get("PROXY_CONCURRENCY", "3"))
+PING_SECS = float(os.environ.get("PING_SECS", "5"))
+SEM = None  # created lazily inside the event loop
 
 app = FastAPI()
 client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10))
@@ -294,12 +301,44 @@ async def messages(request: Request):
         guard_blocked = False
         finish = None
         usage = {}
-        async with client.stream("POST", f"{BACKEND}/v1/chat/completions", json=req) as r:
-            if r.status_code != 200:
-                err = (await r.aread()).decode(errors="replace")
-                yield sse("error", {"type": "error", "error": {"type": "api_error", "message": err}})
-                return
-            async for line in r.aiter_lines():
+        global SEM
+        if SEM is None:
+            SEM = asyncio.Semaphore(PROXY_CONCURRENCY)
+        q = asyncio.Queue()
+        t0 = time.time()
+        stats = {"wait": 0.0, "first": None, "chars": 0, "status": "?"}
+
+        async def producer():
+            try:
+                tq = time.time()
+                async with SEM:
+                    stats["wait"] = time.time() - tq
+                    async with client.stream("POST", f"{BACKEND}/v1/chat/completions", json=req) as r:
+                        if r.status_code != 200:
+                            await q.put(("err", (await r.aread()).decode(errors="replace")))
+                            return
+                        async for line in r.aiter_lines():
+                            await q.put(("line", line))
+            except Exception as e:  # backend died / connection reset
+                await q.put(("err", f"backend error: {e!r}"))
+            finally:
+                await q.put(("end", None))
+
+        task = asyncio.create_task(producer())
+        try:
+            while True:
+                try:
+                    kind, val = await asyncio.wait_for(q.get(), PING_SECS)
+                except asyncio.TimeoutError:
+                    yield sse("ping", {"type": "ping"})
+                    continue
+                if kind == "end":
+                    break
+                if kind == "err":
+                    stats["status"] = "backend-error"
+                    yield sse("error", {"type": "error", "error": {"type": "api_error", "message": val}})
+                    return
+                line = val
                 if not line.startswith("data:"):
                     continue
                 payload = line[5:].strip()
@@ -316,6 +355,9 @@ async def messages(request: Request):
                 ch = d["choices"][0]
                 delta = ch.get("delta") or {}
                 if delta.get("content"):
+                    stats["chars"] += len(delta["content"])
+                    if stats["first"] is None:
+                        stats["first"] = time.time() - t0
                     if not text_open:
                         idx += 1
                         text_open = True
@@ -325,6 +367,14 @@ async def messages(request: Request):
                     pending.append(tc)
                 if ch.get("finish_reason"):
                     finish = ch["finish_reason"]
+            stats["status"] = "ok"
+        finally:
+            task.cancel()  # client gone or done: abort backend generation (frees the semaphore/GPU)
+            stats["dur"] = time.time() - t0
+            print(f"[REQ {mid[-6:]}] {stats['status']} dur={stats['dur']:.1f}s queue_wait={stats['wait']:.1f}s "
+                  f"first_token={stats['first'] if stats['first'] is None else round(stats['first'],1)}s "
+                  f"text_chars={stats['chars']} tools={len(pending)} finish={finish} usage={usage.get('prompt_tokens')}+{usage.get('completion_tokens')}",
+                  file=sys.stderr, flush=True)
         if text_open:
             yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
             text_open = False

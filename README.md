@@ -65,6 +65,9 @@ Environment variables:
 | `THINKING` | 0 | Set to 1 to enable Qwen's thinking mode (slower) |
 | `COMPACT_THRESHOLD` | 48000 | Estimated token count that triggers EoCC compaction (0 disables it) |
 | `MAX_TOKENS_CAP` | 8192 | Maximum output tokens per response |
+| `PROXY_CONCURRENCY` | 3 | Max simultaneous generations (parallel subagents queue in the proxy) |
+| `PING_SECS` | 5 | Keep-alive `ping` interval on the SSE stream while the model is thinking/prefilling |
+| `API_TIMEOUT_MS` | 3600000 | Claude Code's per-request timeout (set by `claude-local`; Claude Code's own default is 10 min) |
 
 ## Guard (exfiltration / misbehavior tripwire)
 The model is uncensored and small, so every tool call it produces is inspected by the proxy (`guard.py`) **before** Claude Code sees it.
@@ -99,6 +102,12 @@ From then on only "original task + recap + later turns" is sent, which keeps the
 (less KV-cache memory and lower decode latency).
 Claude Code's own system prompt and tool definitions take about 15–20K tokens, so the threshold is set high (48K).
 The paper's results were measured on API models; the effect on a local 9B model is untested.
+
+## Timeouts / slow subagents
+A 9B local model needs tens of seconds to prefill a 15–30K-token Claude Code prompt and ~30 tok/s to generate, and parallel subagents share one GPU.
+`claude-local` therefore raises `API_TIMEOUT_MS`, the proxy sends keep-alive pings, queues generations beyond `PROXY_CONCURRENCY`,
+and aborts the backend generation when the client disconnects. Every request is logged with timings:
+`claude-local logs` → `[REQ …] ok dur=… queue_wait=… first_token=…`.
 
 ## Known caveats
 - Image input is not supported (images are omitted)
