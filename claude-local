@@ -4,6 +4,7 @@
 #   claude-local status     show backend status
 #   claude-local stop       stop the backend (mlx_lm.server + proxy)
 #   claude-local logs       tail the logs
+#   claude-local guardlog   show what the Guard blocked (GUARD=block|warn|off, GUARD_ALLOW_HOSTS=a.com,b.org)
 # The backend keeps running after claude exits (instant next start). Stop it with `claude-local stop`.
 set -euo pipefail
 
@@ -31,6 +32,7 @@ stop_all() {
 
 case "${1:-}" in
   stop) stop_all; exit 0 ;;
+  guardlog) cat "$STATE/guard.log" 2>/dev/null || echo "(nothing blocked yet)"; exit 0 ;;
   logs) exec tail -f "$STATE/mlx.log" "$STATE/proxy.log" ;;
   status)
     alive "$STATE/mlx.pid" && echo "mlx_lm.server: running (:$MLX_PORT)" || echo "mlx_lm.server: stopped"
@@ -49,7 +51,7 @@ if ! alive "$STATE/mlx.pid"; then
 fi
 
 if ! alive "$STATE/proxy.pid"; then
-  BACKEND_URL="http://127.0.0.1:$MLX_PORT" BACKEND_MODEL="$MODEL_DIR" PROXY_PORT="$PROXY_PORT" \
+  GUARD="${GUARD:-block}" GUARD_LOG="$STATE/guard.log" BACKEND_URL="http://127.0.0.1:$MLX_PORT" BACKEND_MODEL="$MODEL_DIR" PROXY_PORT="$PROXY_PORT" \
     nohup "$PY" "$DIR/anthropic_proxy.py" >"$STATE/proxy.log" 2>&1 &
   echo $! >"$STATE/proxy.pid"
 fi

@@ -5,10 +5,13 @@ Claude Code  --/v1/messages-->  this proxy  --/v1/chat/completions-->  mlx_lm.se
 """
 import json
 import os
+import re
 import sys
+import time
 import uuid
 
 import httpx
+import guard
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
@@ -18,6 +21,43 @@ BACKEND_MODEL = os.environ.get("BACKEND_MODEL", "default_model")
 # Qwen3.5 thinking is slow for an agent loop; disable by default (THINKING=1 to enable).
 THINKING = os.environ.get("THINKING", "0") == "1"
 MAX_TOKENS_CAP = int(os.environ.get("MAX_TOKENS_CAP", "8192"))
+
+# --- Guard: inspect tool calls from the model before Claude Code sees them -------------
+GUARD_MODE = os.environ.get("GUARD", "block")  # block | warn | off
+GUARD_LOG = os.environ.get("GUARD_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".state", "guard.log"))
+
+
+def _cwd(body):
+    sysm = body.get("system")
+    txt = sysm if isinstance(sysm, str) else _text_of(sysm or [])
+    m = re.search(r"Primary working directory:\s*(\S+)", txt)
+    return m.group(1) if m else None
+
+
+def run_guard(tool_uses, cwd):
+    """tool_uses: list of (name, input). Returns (allowed: bool, message: str|None)."""
+    if GUARD_MODE == "off":
+        return True, None
+    blocked = []
+    for name, inp in tool_uses:
+        why = guard.check_tool_call(name, inp, cwd)
+        if why:
+            blocked.append((name, inp, why))
+    if not blocked:
+        return True, None
+    try:
+        os.makedirs(os.path.dirname(GUARD_LOG), exist_ok=True)
+        with open(GUARD_LOG, "a") as f:
+            for name, inp, why in blocked:
+                f.write(json.dumps({"ts": time.strftime("%F %T"), "mode": GUARD_MODE, "tool": name, "reason": why, "input": inp}, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    for name, _, why in blocked:
+        print(f"[GUARD:{GUARD_MODE}] {name}: {why}", file=sys.stderr, flush=True)
+    if GUARD_MODE == "warn":
+        return True, None
+    return False, guard.format_block_message(blocked)
+
 
 # --- EoCC (End-of-Conversation Compaction), arXiv:2611.05306 ---------------------
 # Estimated total prompt tokens (system + tools + messages) above which the history is
@@ -229,10 +269,15 @@ async def messages(request: Request):
         content = []
         if msg.get("content"):
             content.append({"type": "text", "text": msg["content"]})
-        for tc in msg.get("tool_calls") or []:
-            content.append({"type": "tool_use", "id": tc.get("id") or "toolu_" + uuid.uuid4().hex[:16],
-                            "name": tc["function"]["name"], "input": _args(tc["function"].get("arguments"))})
-        stop = "tool_use" if any(c["type"] == "tool_use" for c in content) else STOP.get(ch.get("finish_reason"), "end_turn")
+        tus = [{"type": "tool_use", "id": tc.get("id") or "toolu_" + uuid.uuid4().hex[:16],
+                "name": tc["function"]["name"], "input": _args(tc["function"].get("arguments"))}
+               for tc in msg.get("tool_calls") or []]
+        ok, why = run_guard([(t["name"], t["input"]) for t in tus], _cwd(body))
+        if not ok:
+            content = [{"type": "text", "text": why}]
+            tus = []
+        content += tus
+        stop = "tool_use" if tus else ("end_turn" if not ok else STOP.get(ch.get("finish_reason"), "end_turn"))
         u = d.get("usage", {})
         return {"id": mid, "type": "message", "role": "assistant", "model": model, "content": content or [{"type": "text", "text": ""}],
                 "stop_reason": stop, "stop_sequence": None,
@@ -245,6 +290,8 @@ async def messages(request: Request):
         idx = -1
         text_open = False
         saw_tool = False
+        pending = []
+        guard_blocked = False
         finish = None
         usage = {}
         async with client.stream("POST", f"{BACKEND}/v1/chat/completions", json=req) as r:
@@ -275,9 +322,23 @@ async def messages(request: Request):
                         yield sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}})
                     yield sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": delta["content"]}})
                 for tc in delta.get("tool_calls") or []:
-                    if text_open:
-                        yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-                        text_open = False
+                    pending.append(tc)
+                if ch.get("finish_reason"):
+                    finish = ch["finish_reason"]
+        if text_open:
+            yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+            text_open = False
+        if pending:
+            parsed = [(tc.get("function", {}).get("name", ""), _args(tc.get("function", {}).get("arguments"))) for tc in pending]
+            ok, why = run_guard(parsed, _cwd(body))
+            if not ok:
+                guard_blocked = True
+                idx += 1
+                yield sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}})
+                yield sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": why}})
+                yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+            else:
+                for tc in pending:
                     saw_tool = True
                     idx += 1
                     fn = tc.get("function", {})
@@ -288,14 +349,10 @@ async def messages(request: Request):
                         "type": "tool_use", "id": tc.get("id") or "toolu_" + uuid.uuid4().hex[:16], "name": fn.get("name", ""), "input": {}}})
                     yield sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": args or "{}"}})
                     yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-                if ch.get("finish_reason"):
-                    finish = ch["finish_reason"]
-        if text_open:
-            yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
         if idx < 0:  # empty reply: emit an empty text block so clients don't choke
             yield sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
             yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
-        stop = "tool_use" if saw_tool else STOP.get(finish, "end_turn")
+        stop = "tool_use" if saw_tool else ("end_turn" if guard_blocked else STOP.get(finish, "end_turn"))
         yield sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
                                     "usage": {"input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)}})
         yield sse("message_stop", {"type": "message_stop"})

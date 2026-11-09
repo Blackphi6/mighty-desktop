@@ -11,7 +11,8 @@ claude  --/v1/messages-->  anthropic_proxy.py  --/v1/chat/completions-->  mlx_lm
 | File | Purpose |
 |---|---|
 | `claude-local` | Launcher. Starts the backend as a persistent service and opens `claude` |
-| `anthropic_proxy.py` | Anthropic Messages API → OpenAI-compatible API proxy (streaming and tool calls supported) + EoCC compaction |
+| `anthropic_proxy.py` | Anthropic Messages API → OpenAI-compatible API proxy (streaming and tool calls supported) + EoCC compaction + Guard hook |
+| `guard.py` | Tool-call inspection (exfiltration, credential access, persistence, destructive commands) |
 | `convert_model.py` | HF → MLX 4-bit conversion (quantizes on CPU) |
 | `setup.sh` | Creates the venv, downloads and converts the model, registers the command on PATH |
 
@@ -64,6 +65,32 @@ Environment variables:
 | `THINKING` | 0 | Set to 1 to enable Qwen's thinking mode (slower) |
 | `COMPACT_THRESHOLD` | 48000 | Estimated token count that triggers EoCC compaction (0 disables it) |
 | `MAX_TOKENS_CAP` | 8192 | Maximum output tokens per response |
+
+## Guard (exfiltration / misbehavior tripwire)
+The model is uncensored and small, so every tool call it produces is inspected by the proxy (`guard.py`) **before** Claude Code sees it.
+If a call looks dangerous it is dropped, nothing is executed, and Claude Code shows an error message
+(`🛑 mightyCode Guard blocked this step`) with the tool, the reason and the input. The attempt is logged to `.state/guard.log`.
+
+Blocked by default:
+- Network access (`curl`, `wget`, `nc`, `ssh`, `scp`, `git push`, `/dev/tcp`, Python/Node HTTP libraries, `WebFetch`, MCP tool arguments, …) to hosts that are not allowlisted
+- Secrets together with network access: SSH keys, cloud/git credentials, `.env`, keychain, environment variables, API-key-looking strings, long encoded blobs
+- Reading credential files, DNS exfiltration (`nslookup $(...)`), `curl | sh`, `base64 -d | sh`
+- Writing to persistence locations (`~/.zshrc`, `authorized_keys`, LaunchAgents, `.git/hooks`, Claude settings), `crontab`, `launchctl`
+- Destructive/privileged commands: `rm -rf /` or `~`, `sudo`, `mkfs`, `dd of=/dev/…`
+- Scripts (`python x.py`, …) are opened and checked too, and file contents written with `Write`/`Edit` are scanned
+
+```bash
+claude-local guardlog                              # what was blocked
+GUARD_ALLOW_HOSTS=example.com claude-local         # extra allowed hosts (default list: localhost, github.com, huggingface.co, pypi.org, npmjs.org, …)
+GUARD=warn claude-local                            # log only, do not block
+GUARD=off claude-local                             # disable (restart the backend first: claude-local stop)
+python3 -I tests/test_guard.py                     # unit tests
+```
+Note: the backend (proxy) is persistent, so after changing `GUARD*` variables run `claude-local stop` first.
+
+**This is a heuristic tripwire, not a sandbox.** A determined model can evade pattern matching (e.g. by obfuscation). Do not run Claude Code with
+`--permission-mode bypassPermissions` against this model, keep the normal permission prompts on, and for hard guarantees add an OS-level
+egress filter (pf, Little Snitch / LuLu) or run it in a container/VM.
 
 ## EoCC (End-of-Conversation Compaction)
 Based on [arXiv:2611.05306 "You don't need long context"](https://arxiv.org/abs/2611.05306). When the context exceeds a threshold,
