@@ -36,6 +36,9 @@ claude --version   # verify
 See https://code.claude.com/docs for the latest instructions. You do not need to log in with an Anthropic account to use it with a local model.
 
 ### 2. This repository
+A pre-converted model is available at https://huggingface.co/shi3z/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-MLX-4bit
+(skip the 19 GB download and conversion: `hf download shi3z/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-MLX-4bit --local-dir models/heretic-9b-mlx-4bit`, then run `./setup.sh`).
+
 ```bash
 git clone https://github.com/shi3z/mightyCode.git
 cd mightyCode
