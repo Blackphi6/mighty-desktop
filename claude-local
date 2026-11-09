@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# claude-local: Claude Code を、ローカルの MLX モデル(Heretic 9B)をバックエンドにして起動する。
-#   claude-local            バックエンドを(未起動なら)起動して claude を開く。引数はそのまま claude へ
-#   claude-local status     バックエンドの状態表示
-#   claude-local stop       バックエンド(mlx_lm.server + プロキシ)を停止
-#   claude-local logs       ログを tail
-# バックエンドは claude 終了後も常駐する(次回の起動が即時)。止めるときは `claude-local stop`。
+# claude-local: launch Claude Code on a local MLX model (Heretic 9B).
+#   claude-local            start the backend if needed, then open claude (args are passed through)
+#   claude-local status     show backend status
+#   claude-local stop       stop the backend (mlx_lm.server + proxy)
+#   claude-local logs       tail the logs
+# The backend keeps running after claude exits (instant next start). Stop it with `claude-local stop`.
 set -euo pipefail
 
 SRC="${BASH_SOURCE[0]}"
-while [[ -L "$SRC" ]]; do  # シンボリックリンクを辿って実体の場所を求める
+while [[ -L "$SRC" ]]; do  # resolve symlinks to find the real location
   LINK="$(readlink "$SRC")"
   [[ "$LINK" == /* ]] && SRC="$LINK" || SRC="$(dirname "$SRC")/$LINK"
 done
@@ -38,10 +38,10 @@ case "${1:-}" in
     exit 0 ;;
 esac
 
-[[ -f "$MODEL_DIR/config.json" ]] || { echo "モデルが見つかりません: $MODEL_DIR" >&2; exit 1; }
+[[ -f "$MODEL_DIR/config.json" ]] || { echo "Model not found: $MODEL_DIR" >&2; exit 1; }
 
 if ! alive "$STATE/mlx.pid"; then
-  echo "▶ mlx_lm.server を起動中 (初回はモデル読み込みに数十秒)..."
+  echo "▶ Starting mlx_lm.server (first load takes a few tens of seconds)..."
   nohup "$PY" -m mlx_lm server --model "$MODEL_DIR" --host 127.0.0.1 --port "$MLX_PORT" \
     --temp 0.6 --top-p 0.95 --max-tokens 8192 --prompt-cache-size 4 \
     >"$STATE/mlx.log" 2>&1 &
@@ -54,10 +54,10 @@ if ! alive "$STATE/proxy.pid"; then
   echo $! >"$STATE/proxy.pid"
 fi
 
-# 準備完了待ち (最大5分)
+# wait until ready (up to 5 min)
 for i in $(seq 1 300); do
   curl -sf "http://127.0.0.1:$MLX_PORT/v1/models" >/dev/null 2>&1 && curl -sf "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 && break
-  alive "$STATE/mlx.pid" || { echo "mlx_lm.server が落ちました。ログ: $STATE/mlx.log" >&2; tail -20 "$STATE/mlx.log" >&2; exit 1; }
+  alive "$STATE/mlx.pid" || { echo "mlx_lm.server crashed. Log: $STATE/mlx.log" >&2; tail -20 "$STATE/mlx.log" >&2; exit 1; }
   sleep 1
 done
 

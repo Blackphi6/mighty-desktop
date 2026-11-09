@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HF のモデルを MLX 4bit に変換する。CPU で量子化する(GPU だと遅い外付けディスク等で Metal タイムアウトになることがあるため)。
+"""Convert an HF model to MLX 4-bit. Quantizes on the CPU (the GPU can hit Metal timeouts, e.g. on slow external disks).
 usage: convert_model.py <src_dir> <dst_dir>"""
 import sys
 import mlx.core as mx
