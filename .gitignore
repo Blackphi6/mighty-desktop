@@ -3,3 +3,5 @@
 models/
 convert.log
 __pycache__/
+gui/mighty
+gui/Resources/mighty.iconset/

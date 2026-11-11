@@ -57,6 +57,20 @@ claude-local logs     # tail the logs
 claude-local stop     # stop the backend (it keeps running after claude exits, so stop it when you no longer need it)
 ```
 
+### macOS desktop app (mighty.app)
+A native SwiftUI chat window (no terminal) on top of the same backend, with a sidebar of
+conversations (create/rename/delete), persistent history (`~/Library/Application
+Support/mighty/conversations/`), and a WebSearch tool (DuckDuckGo).
+
+```bash
+cd gui
+./build.sh   # builds and installs /Applications/mighty.app
+```
+
+On first launch it asks you to pick the mightyCode folder (the one you ran `setup.sh` in);
+after that it's remembered. Plain chat only — it talks to the proxy's `/v1/messages`
+directly, not through Claude Code's own tool-use/agent loop.
+
 Environment variables:
 | Variable | Default | Description |
 |---|---|---|
