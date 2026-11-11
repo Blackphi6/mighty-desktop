@@ -1,4 +1,6 @@
-# mightyCode
+# mighty-desktop
+
+Fork of [shi3z/mightyCode](https://github.com/shi3z/mightyCode) adding a native macOS desktop app (see below).
 
 Run **Claude Code** on a local MLX model
 ([DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic](https://huggingface.co/xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic)).
